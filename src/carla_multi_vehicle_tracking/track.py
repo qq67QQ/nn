@@ -5,12 +5,16 @@ YOLO + DeepSort 多车跟踪系统
 兼容 Python 3.8.10 + CARLA 0.9.13 + Windows 10
 
 【新增：轨迹预测+提前碰撞预警模块】
+【新增：车速估算 + 超速报警】
+【新增：违章行为检测】
 
 功能说明：
 1. 实时跟踪多个车辆目标
 2. 记录每辆车的轨迹历史（中心点）
 3. 基于轨迹预测未来位置
 4. 检测潜在的碰撞风险并预警
+5. 估算车辆行驶速度，超速时报警
+6. 检测逆行和拥堵违章行为
 """
 
 from __future__ import print_function, absolute_import
@@ -58,6 +62,24 @@ except ImportError:
 
 import random
 
+# ==================== 【新增：违章行为检测】配置参数 ====================
+# 轨迹字典：保存每个车辆的轨迹
+violation_trajectories = {}
+# 拥堵判定：画面车辆≥6 辆视为拥堵
+CONGESTION_THRESHOLD = 6
+
+# ==================== 【新增：车速估算 + 超速报警】配置参数 ====================
+# 以下参数可自由调整
+
+# 帧率：视频帧率
+FPS = 30  # 每秒帧数
+# 像素与米的换算系数（1像素等于多少米）
+PIXEL_TO_METER = 0.1  # 1像素 = 0.1米
+# 限速（km/h）
+SPEED_LIMIT = 60  # 限速60公里/小时
+# 保存车辆轨迹字典（用于存储每个track_id的最近几帧中心点）
+vehicle_trajectories = {}
+
 # ==================== 【原有】基础配置常量 ====================
 class_id = [2, 3, 5, 7]
 class_name = {2: 'car', 3: 'motobike', 5: 'bus', 7: 'truck'}
@@ -97,6 +119,236 @@ COLLISION_WARNING_TEXT_THICKNESS = 2  # 文字粗细
 COLLISION_WARNING_TEXT_POSITION = (10, 30)  # 文字位置 (x, y)
 COLLISION_WARNING_MESSAGE = "COLLISION WARNING!"  # 预警文字
 
+# ==================== 【新增：违章行为检测】函数定义 ====================
+
+def update_violation_trajectories(tracked_vehicles, traj_dict):
+    """
+    【新增：违章行为检测】
+    更新车辆轨迹，保存最近8帧中心点
+    
+    参数:
+        tracked_vehicles: DeepSort输出的跟踪结果
+        traj_dict: 车辆轨迹字典
+    """
+    # 遍历所有跟踪车辆
+    for output in tracked_vehicles:
+        if len(output) >= 5:
+            try:
+                x1, y1, x2, y2 = map(int, output[0:4])
+                track_id = int(output[4])
+                
+                # 计算中心点
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                
+                # 更新轨迹字典
+                if track_id not in traj_dict:
+                    traj_dict[track_id] = []
+                traj_dict[track_id].append((center_x, center_y))
+                # 只保存最近8帧
+                if len(traj_dict[track_id]) > 8:
+                    traj_dict[track_id].pop(0)
+                    
+            except (ValueError, TypeError, IndexError):
+                continue
+
+def detect_violations(traj_dict, tracked_vehicles, img_height, congestion_threshold):
+    """
+    【新增：违章行为检测】
+    检测车辆违章行为（逆行和拥堵）
+    
+    参数:
+        traj_dict: 车辆轨迹字典
+        tracked_vehicles: DeepSort输出的跟踪结果
+        img_height: 画面高度
+        congestion_threshold: 拥堵阈值
+    
+    返回:
+        set: retrograde_ids 逆行车辆ID集合
+        bool: is_congested 是否拥堵
+    """
+    retrograde_ids = set()
+    vehicle_count = len(tracked_vehicles)
+    
+    # 判断是否拥堵
+    is_congested = vehicle_count >= congestion_threshold
+    if is_congested:
+        print(f"【拥堵警告】当前区域车辆密集，存在拥堵风险")
+    
+    # 判断逆行
+    for track_id, traj in traj_dict.items():
+        if len(traj) >= 2:
+            # 计算车辆整体移动方向
+            total_dy = 0
+            for i in range(1, len(traj)):
+                prev_y = traj[i-1][1]
+                curr_y = traj[i][1]
+                total_dy += (prev_y - curr_y)  # y减少表示向上移动
+            
+            # 车辆整体向上移动 → 判定逆行
+            if total_dy > 0:  # 总位移是向上的
+                retrograde_ids.add(track_id)
+                print(f"【逆行警告】车辆 ID:{track_id} 存在逆行行为")
+    
+    return retrograde_ids, is_congested
+
+def draw_violation_warnings(frame, retrograde_ids, is_congested, tracked_vehicles):
+    """
+    【新增：违章行为检测】
+    在画面上绘制违章警告信息
+    
+    参数:
+        frame: 视频帧
+        retrograde_ids: 逆行车辆ID集合
+        is_congested: 是否拥堵
+        tracked_vehicles: 跟踪结果
+    
+    返回:
+        frame: 绘制了警告信息的帧
+    """
+    # 准备顶部警告文字
+    warning_text = ""
+    if is_congested and len(retrograde_ids) > 0:
+        warning_text = "逆行 / 拥堵状态"
+    elif len(retrograde_ids) > 0:
+        warning_text = "逆行状态"
+    elif is_congested:
+        warning_text = "拥堵状态"
+    
+    # 绘制顶部警告文字
+    if warning_text:
+        cv2.putText(
+            frame,
+            warning_text,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+    
+    # 为逆行车辆绘制红色边框
+    for output in tracked_vehicles:
+        if len(output) >= 5:
+            try:
+                x1, y1, x2, y2 = map(int, output[0:4])
+                track_id = int(output[4])
+                
+                # 如果是逆行车辆，绘制红色边框
+                if track_id in retrograde_ids:
+                    cv2.rectangle(
+                        frame, 
+                        (x1, y1), 
+                        (x2, y2), 
+                        (0, 0, 255), 
+                        3
+                    )
+            except (ValueError, TypeError, IndexError):
+                continue
+    
+    return frame
+
+# ==================== 【新增：车速估算 + 超速报警】函数定义 ====================
+
+def update_vehicle_trajectories(tracked_vehicles, traj_dict):
+    """
+    【新增：车速估算 + 超速报警】
+    更新车辆轨迹，保存最近5帧中心点
+    
+    参数:
+        tracked_vehicles: DeepSort输出的跟踪结果
+        traj_dict: 车辆轨迹字典
+    """
+    # 遍历所有跟踪车辆
+    for output in tracked_vehicles:
+        if len(output) >= 5:
+            try:
+                x1, y1, x2, y2 = map(int, output[0:4])
+                track_id = int(output[4])
+                
+                # 计算中心点
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                
+                # 更新轨迹字典
+                if track_id not in traj_dict:
+                    traj_dict[track_id] = []
+                traj_dict[track_id].append((center_x, center_y))
+                # 只保存最近5帧
+                if len(traj_dict[track_id]) > 5:
+                    traj_dict[track_id].pop(0)
+                    
+            except (ValueError, TypeError, IndexError):
+                continue
+
+def calculate_speed(traj, fps, pixel_to_meter):
+    """
+    【新增：车速估算 + 超速报警】
+    基于轨迹计算车辆速度
+    
+    参数:
+        traj: 轨迹列表 [(cx1, cy1), (cx2, cy2), ...]
+        fps: 帧率
+        pixel_to_meter: 像素转米的比例
+    
+    返回:
+        float: 速度(km/h)，如果轨迹不足2帧返回0
+    """
+    if len(traj) < 2:
+        return 0.0
+    
+    # 计算最近两帧的中心点
+    prev_x, prev_y = traj[-2]
+    curr_x, curr_y = traj[-1]
+    
+    # 计算像素距离
+    pixel_distance = ((curr_x - prev_x) ** 2 + (curr_y - prev_y) ** 2) ** 0.5
+    
+    # 换算成米
+    meter_distance = pixel_distance * pixel_to_meter
+    
+    # 计算每秒移动时间（秒）
+    time_seconds = 1 / fps
+    
+    # 计算米每秒 (m/s)
+    speed_ms = meter_distance / time_seconds
+    
+    # 换算成公里每小时 (km/h)
+    speed_kmh = speed_ms * 3.6
+    
+    return speed_kmh
+
+def estimate_vehicle_speeds(traj_dict, fps, pixel_to_meter, speed_limit):
+    """
+    【新增：车速估算 + 超速报警】
+    估算所有车辆速度，判断是否超速
+    
+    参数:
+        traj_dict: 车辆轨迹字典
+        fps: 帧率
+        pixel_to_meter: 像素转米的比例
+        speed_limit: 限速
+    
+    返回:
+        dict: speed_dict {track_id: speed_kmh}
+        set: overspeed_ids {track_id}
+    """
+    speed_dict = {}
+    overspeed_ids = set()
+    
+    for track_id, traj in traj_dict.items():
+        speed = calculate_speed(traj, fps, pixel_to_meter)
+        speed_dict[track_id] = speed
+        
+        # 判断是否超速
+        if speed > speed_limit:
+            overspeed_ids.add(track_id)
+            # 控制台输出超速警告
+            print(f"【超速警告】车辆 ID:{track_id} 当前速度：{speed:.1f} km/h")
+    
+    return speed_dict, overspeed_ids
+
 # ==================== 【新增：轨迹预测+提前碰撞预警】函数定义 ====================
 
 def initialize_trajectory_dict():
@@ -116,7 +368,7 @@ def update_trajectory(trajectory_dict, tracked_vehicles):
     更新所有车辆的轨迹历史
     
     参数:
-        trajectory_dict: 轨迹历史字典 {track_id: [(cx1,cy1), (cx2,cy2), ...]}
+        trajectory_dict: 轨迹历史字典 {track_id: [(cx1,cy1), (cx2,cy2), ...}
         tracked_vehicles: DeepSort输出的跟踪结果，格式为 [x1, y1, x2, y2, track_id, ...]
     
     功能:
@@ -385,6 +637,12 @@ class VehicleTracker:
         # 【新增：轨迹预测+提前碰撞预警】初始化轨迹历史字典
         self.trajectory_dict = initialize_trajectory_dict()
         
+        # 【新增：车速估算 + 超速报警】初始化车辆轨迹字典
+        self.vehicle_traj = {}
+        
+        # 【新增：违章行为检测】初始化违章检测轨迹字典
+        self.violation_traj = {}
+        
         if ULTRALYTICS_AVAILABLE:
             self._load_yolo_model()
         
@@ -503,7 +761,7 @@ class VehicleTracker:
         label_colour = [int((p * (label ** 2 - label + 1)) % 255) for p in palette]
         return tuple(label_colour)
     
-    def draw_bbox(self, frame, output, conf, cls_id, collision_risk_ids=None):
+    def draw_bbox(self, frame, output, conf, cls_id, collision_risk_ids=None, speed_dict=None, overspeed_ids=None, retrograde_ids=None):
         """
         【原有函数，修改】绘制边界框
         
@@ -513,10 +771,15 @@ class VehicleTracker:
             conf: 置信度
             cls_id: 类别ID
             collision_risk_ids: 【新增参数】有碰撞风险的track_id集合，如果为None则不检查
+            speed_dict: 【新增：车速估算 + 超速报警】车辆速度字典
+            overspeed_ids: 【新增：车速估算 + 超速报警】超速车辆ID集合
+            retrograde_ids: 【新增：违章行为检测】逆行车辆ID集合
         
         功能:
             1. 如果车辆在collision_risk_ids中，绘制红色边框
-            2. 否则使用原有颜色逻辑
+            2. 如果车辆在overspeed_ids中，绘制红色边框，显示速度
+            3. 如果车辆在retrograde_ids中，绘制红色边框
+            4. 否则使用原有颜色逻辑，显示速度
         """
         try:
             x1, y1, x2, y2 = map(int, output[0:4])
@@ -526,19 +789,43 @@ class VehicleTracker:
             if not isinstance(frame, np.ndarray):
                 frame = np.array(frame)
             
-            # 【新增：轨迹预测+提前碰撞预警】判断是否为风险车辆
+            # 【新增：车速估算 + 超速报警】判断是否为超速车辆
+            is_overspeed = False
+            if overspeed_ids is not None and track_id in overspeed_ids:
+                is_overspeed = True
+            
+            # 【新增：轨迹预测+提前碰撞预警】判断是否为碰撞风险车辆
+            is_risk = False
             if collision_risk_ids is not None and track_id in collision_risk_ids:
-                # 使用预警颜色（红色）
-                colour = COLLISION_WARNING_COLOR
-                label = f"[!] {label}"  # 在标签前加[!]标记
+                is_risk = True
+            
+            # 【新增：违章行为检测】判断是否为逆行车辆
+            is_retrograde = False
+            if retrograde_ids is not None and track_id in retrograde_ids:
+                is_retrograde = True
+            
+            # 【新增：车速估算 + 超速报警】获取车辆速度
+            speed_str = ""
+            if speed_dict is not None and track_id in speed_dict:
+                speed_str = f" {speed_dict[track_id]:.1f}km/h"
+            
+            # 确定颜色和标签
+            if is_overspeed or is_risk or is_retrograde:
+                # 违章车辆使用红色
+                colour = (0, 0, 255)
+                label = f"[!] {label}"
             else:
-                # 使用原有颜色逻辑
+                # 普通车辆使用原有颜色
                 colour = self.colour_label(track_id)
             
-            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 1, 1)[0]
-            c_id = f'{label} {track_id}'
+            c_id = f'{label} {track_id}{speed_str}'
             
-            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 1)
+            t_size = cv2.getTextSize(c_id, cv2.FONT_HERSHEY_PLAIN, 1, 1)[0]
+            
+            # 根据是否为违章车辆决定边框粗细
+            box_thickness = 3 if is_overspeed or is_risk or is_retrograde else 1
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, box_thickness)
             cv2.rectangle(frame, (x1, y1), (x1 + t_size[0] + 3, y1 + t_size[1] + 4), colour, -1)
             cv2.putText(frame, c_id, (x1, y1 + t_size[1] + 4), 
                        cv2.FONT_HERSHEY_PLAIN, 1, [255, 255, 255], 2)
@@ -554,7 +841,11 @@ class VehicleTracker:
         新增功能:
             1. 更新轨迹历史
             2. 基于轨迹预测碰撞风险
-            3. 绘制预警信息
+            3. 【新增：车速估算 + 超速报警】更新车辆轨迹
+            4. 【新增：车速估算 + 超速报警】估算车辆速度，判断是否超速
+            5. 【新增：违章行为检测】更新违章检测轨迹
+            6. 【新增：违章行为检测】检测逆行和拥堵
+            7. 绘制预警信息
         """
         frame, bbox_xyxy, conf_score, cls_id = self.yolo_details(frame)
         
@@ -566,6 +857,20 @@ class VehicleTracker:
                     # 【新增：轨迹预测+提前碰撞预警】更新轨迹历史
                     update_trajectory(self.trajectory_dict, outputs)
                     
+                    # 【新增：车速估算 + 超速报警】更新车辆轨迹（用于速度计算）
+                    update_vehicle_trajectories(outputs, self.vehicle_traj)
+                    
+                    # 【新增：违章行为检测】更新违章检测轨迹
+                    update_violation_trajectories(outputs, self.violation_traj)
+                    
+                    # 【新增：车速估算 + 超速报警】估算车辆速度，判断是否超速
+                    speed_dict, overspeed_ids = estimate_vehicle_speeds(
+                        self.vehicle_traj,
+                        FPS,
+                        PIXEL_TO_METER,
+                        SPEED_LIMIT
+                    )
+                    
                     # 【新增：轨迹预测+提前碰撞预警】检测碰撞风险
                     collision_risk = check_trajectory_collision(
                         self.trajectory_dict,
@@ -574,17 +879,36 @@ class VehicleTracker:
                         img_w
                     )
                     
+                    # 【新增：违章行为检测】检测逆行和拥堵
+                    retrograde_ids, is_congested = detect_violations(
+                        self.violation_traj,
+                        outputs,
+                        img_h,
+                        CONGESTION_THRESHOLD
+                    )
+                    
                     # 提取风险车辆ID集合
                     collision_risk_ids = set(collision_risk.keys())
                     
                     # 【新增：轨迹预测+提前碰撞预警】绘制预警信息
                     frame = draw_collision_warning(frame, collision_risk_ids, outputs)
                     
-                    # 【原有逻辑，保持不变】绘制边界框（增加了collision_risk_ids参数）
+                    # 【新增：违章行为检测】绘制违章警告信息
+                    frame = draw_violation_warnings(frame, retrograde_ids, is_congested, outputs)
+                    
+                    # 【原有逻辑，保持不变】绘制边界框（增加了更多参数）
                     min_len = min(len(outputs), len(conf_score), len(cls_id))
                     for i in range(min_len):
-                        frame = self.draw_bbox(frame, outputs[i], conf_score[i], cls_id[i], 
-                                              collision_risk_ids)
+                        frame = self.draw_bbox(
+                            frame, 
+                            outputs[i], 
+                            conf_score[i], 
+                            cls_id[i], 
+                            collision_risk_ids,
+                            speed_dict,
+                            overspeed_ids,
+                            retrograde_ids
+                        )
                     
             except Exception as e:
                 print(f"[ERROR] DeepSort 更新失败: {str(e)}")
@@ -804,7 +1128,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='YOLO + DeepSort 多车跟踪系统\n'
                    '兼容 Python 3.8.10 + CARLA 0.9.13\n\n'
-                   '【新增功能】轨迹预测 + 提前碰撞预警',
+                   '【新增功能】轨迹预测 + 提前碰撞预警\n'
+                   '【新增功能】车速估算 + 超速报警\n'
+                   '【新增功能】违章行为检测',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -823,6 +1149,8 @@ def check_environment():
     print("=" * 60)
     print("YOLO + DeepSort 多车跟踪系统")
     print("【新增：轨迹预测+提前碰撞预警模块】")
+    print("【新增：车速估算 + 超速报警】")
+    print("【新增：违章行为检测】")
     print("=" * 60)
     print(f"Python: {sys.version}")
     print(f"平台: {sys.platform}")
@@ -834,6 +1162,16 @@ def check_environment():
     print(f"  - 轨迹长度: {MAX_TRAJECTORY_LENGTH} 帧")
     print(f"  - 预测帧数: {PREDICT_FRAMES} 帧")
     print(f"  - 碰撞阈值: {COLLISION_DISTANCE_RATIO*100:.0f}% 画面宽度 ({COLLISION_DISTANCE_THRESHOLD} 像素)")
+    
+    # 显示【新增：车速估算 + 超速报警】配置
+    print("\n【新增：车速估算 + 超速报警】当前配置:")
+    print(f"  - 帧率: {FPS} fps")
+    print(f"  - 像素转米: {PIXEL_TO_METER} m/px")
+    print(f"  - 限速: {SPEED_LIMIT} km/h")
+    
+    # 显示【新增：违章行为检测】配置
+    print("\n【新增：违章行为检测】当前配置:")
+    print(f"  - 拥堵阈值: {CONGESTION_THRESHOLD} 辆")
     print("=" * 60)
 
 
