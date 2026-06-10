@@ -67,7 +67,7 @@ $$X = \left[ speed,\ acceleration,\ dist\_to\_front,\ lane\_offset,\ yaw,\ conge
 ### 3.2 运行效果截图
 
 CARLA 仿真车流场景：
-![alt text](image-1.png)
+![1](./image.png)
 
 
 ### 3.3 输出文件说明
@@ -86,11 +86,14 @@ CARLA 仿真车流场景：
 ## 4. 可视化结果展示
 
 特征重要性可视化图表：
-![alt text](image-1.png)
+![Feature Importance Visualization](feature-importance.png)
 多模型准确率对比图表：
-![alt text](<屏幕截图 2026-06-08 195545-1.png>)
-机器学习模型输出结果:
-![alt text](<屏幕截图 2026-06-05 173310.png>)
-![alt text](<屏幕截图 2026-06-05 172101.png>)
-![alt text](<屏幕截图 2026-06-05 173339.png>)
-![alt text](<屏幕截图 2026-06-05 172521.png>)
+![Model Accuracy Comparison](model-accuracy-comparison.png)
+机器学习模型及分析报告输出结果:
+![Model Output Results](model-output-1.png)
+
+![Model Output Results](model-output-2.png)
+
+![Model Output Results](model-output-3.png)
+
+![Model Output Results](model-output-4.png)
